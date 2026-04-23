@@ -1,3 +1,6 @@
+# RouterLLM has a circular import with tool definitions - defer it
+from typing import TYPE_CHECKING
+
 from openhands.sdk.llm.auth import (
     OPENAI_CODEX_MODELS,
     CredentialStore,
@@ -19,7 +22,6 @@ from openhands.sdk.llm.message import (
     ThinkingBlock,
     content_to_str,
 )
-from openhands.sdk.llm.router import RouterLLM
 from openhands.sdk.llm.streaming import LLMStreamChunk, TokenCallbackType
 from openhands.sdk.llm.utils.metrics import Metrics, MetricsSnapshot, TokenUsage
 from openhands.sdk.llm.utils.unverified_models import (
@@ -27,6 +29,18 @@ from openhands.sdk.llm.utils.unverified_models import (
     get_unverified_models,
 )
 from openhands.sdk.llm.utils.verified_models import VERIFIED_MODELS
+
+
+if TYPE_CHECKING:
+    from openhands.sdk.llm.router import RouterLLM
+
+
+def __getattr__(name: str):
+    if name == "RouterLLM":
+        from openhands.sdk.llm.router import RouterLLM
+
+        return RouterLLM
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 __all__ = [
