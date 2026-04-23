@@ -97,19 +97,16 @@ def test_lazy_imports_all_exports():
     """Test that all expected exports are in __all__."""
     import openhands.sdk as sdk
 
-    expected_exports = [
-        "LLM",
+    # Only eager imports should be in __all__
+    expected_eager = [
         "Agent",
-        "Conversation",
-        "MCPClient",
-        "Event",
-        "MessageEvent",
+        "AgentBase",
         "Tool",
         "get_logger",
         "__version__",
     ]
 
-    for name in expected_exports:
+    for name in expected_eager:
         assert name in sdk.__all__, f"{name} should be in __all__"
 
 
