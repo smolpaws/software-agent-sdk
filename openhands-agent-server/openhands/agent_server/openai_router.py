@@ -106,6 +106,15 @@ class OpenAIModelListResponse(BaseModel):
 
 
 def create_openai_api_key_dependency(config: Config):
+    """Accept the same session key through OpenHands and OpenAI auth shapes.
+
+    ``X-Session-API-Key`` preserves compatibility with existing agent-server
+    clients, while ``Authorization: Bearer`` lets OpenAI-compatible clients use
+    their standard API-key header. Both forms validate against
+    ``config.session_api_keys``; this does not introduce a second credential
+    system.
+    """
+
     def check_openai_api_key(
         session_api_key: str | None = Depends(_SESSION_API_KEY_HEADER),
         authorization: HTTPAuthorizationCredentials | None = Depends(
