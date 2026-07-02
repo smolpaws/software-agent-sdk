@@ -625,6 +625,11 @@ class LocalConversation(BaseConversation):
         # Hold the state lock while reading mutable state from the source
         # conversation to avoid torn reads if run() is executing concurrently.
         with self._state:
+            # Validate before constructing the fork so an unknown branch point
+            # does not leave an orphaned persistence directory behind.
+            if from_event_id is not None and from_event_id not in self._state.events:
+                raise ValueError(f"Unknown from_event_id: {from_event_id}")
+
             # Determine persistence_dir for the fork.
             # Pass the *base* directory only — __init__ calls
             # get_persistence_dir() which appends the conversation ID hex,
@@ -652,8 +657,6 @@ class LocalConversation(BaseConversation):
             # Branch slice copies path_to_root(event) (root-first, re-rootable);
             # a full fork copies the whole log and inherits the source's HEAD.
             if from_event_id is not None:
-                if from_event_id not in self._state.events:
-                    raise ValueError(f"Unknown from_event_id: {from_event_id}")
                 source_events: list[Event] = self._state.events.path_to_root(
                     from_event_id
                 )
