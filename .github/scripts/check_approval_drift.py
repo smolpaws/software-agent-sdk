@@ -45,20 +45,30 @@ _PR_NUM_RE = re.compile(r"\(#(\d+)\)\s*$")
 _OUTSIDE_ASSOC = {"NONE", "FIRST_TIMER", "FIRST_TIME_CONTRIBUTOR", "MANNEQUIN"}
 
 
-def merged_pr_numbers(baseline: str) -> list[tuple[int, str]]:
-    """(pr_number, subject) for commits in ``baseline..HEAD`` that name a PR."""
+def merged_pr_numbers(baseline: str) -> tuple[list[tuple[int, str]], list[str]]:
+    """PRs named in ``baseline..HEAD`` plus the subjects that map to none.
+
+    Returns ``(matched, unmapped)`` where ``matched`` is ``(pr_number,
+    subject)`` for first-parent commits whose subject ends in ``(#N)``, and
+    ``unmapped`` is the subjects that do not — so the caller can surface the
+    blind spot (a merge that skipped the squash convention is exactly the one
+    an approval-drift guard must not silently ignore) instead of dropping it.
+    """
     log = run_git(
         "log", "--first-parent", "--pretty=format:%H%x1f%s", f"{baseline}..HEAD"
     )
-    found: list[tuple[int, str]] = []
+    matched: list[tuple[int, str]] = []
+    unmapped: list[str] = []
     for line in log.splitlines():
         if "\x1f" not in line:
             continue
         _, subject = line.split("\x1f", 1)
         match = _PR_NUM_RE.search(subject)
         if match:
-            found.append((int(match.group(1)), subject))
-    return found
+            matched.append((int(match.group(1)), subject))
+        else:
+            unmapped.append(subject)
+    return matched, unmapped
 
 
 def _is_bot(user: dict[str, object]) -> bool:
@@ -152,8 +162,19 @@ def main() -> int:
         print(report.render())
         return 0
 
-    prs = merged_pr_numbers(baseline)
+    prs, unmapped = merged_pr_numbers(baseline)
     report.add(f"Baseline: `{baseline}` — {len(prs)} merged PR(s) in range.")
+    if unmapped:
+        report.warn(f"{len(unmapped)} commit(s) not mapped to a PR")
+        report.add(
+            f"> ⚠️ {len(unmapped)} first-parent commit(s) in range did not match "
+            "the `(#N)` squash convention and were **not** audited (a merge/rebase "
+            "merge, or a lost `(#N)` suffix). These are a blind spot — inspect them:"
+        )
+        for subject in unmapped[:20]:
+            report.add(f">   - {subject}")
+        if len(unmapped) > 20:
+            report.add(f">   - …and {len(unmapped) - 20} more")
     report.add("")
 
     blocking_rows: list[str] = []

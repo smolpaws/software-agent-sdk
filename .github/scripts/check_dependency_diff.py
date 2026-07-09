@@ -22,6 +22,7 @@ from __future__ import annotations
 import os
 import sys
 import tomllib
+from urllib.parse import urlparse
 
 from security_scan_common import (
     Report,
@@ -32,6 +33,14 @@ from security_scan_common import (
 
 
 LOCKFILE = "uv.lock"
+
+# Exact hosts we accept as the trusted package registry. An exact-host match
+# (not a substring) so a look-alike like ``pypi.org.evil.example`` cannot be
+# mistaken for PyPI. Anything else — a mirror, an alternate index, a git/url
+# source — is *blocked on purpose*: an unexpected source on a release is the
+# supply-chain / dependency-confusion signal we want a human to look at, not
+# something to wave through.
+_TRUSTED_REGISTRY_HOSTS = {"pypi.org", "files.pythonhosted.org"}
 
 
 def _load_lock(ref: str) -> dict[str, dict[str, object]]:
@@ -66,14 +75,31 @@ def _source_label(source: object) -> str:
     return str(source)
 
 
+def _registry_host(source: dict[str, object]) -> str | None:
+    """The host of a ``{registry: url}`` source, or None if not a registry."""
+    registry = source.get("registry")
+    if not isinstance(registry, str):
+        return None
+    return (urlparse(registry).hostname or "").lower()
+
+
 def _is_trusted_registry(source: object) -> bool:
-    """A first-party workspace member or a plain PyPI registry pin is trusted."""
+    """True only for a first-party workspace member or an *exact* PyPI host.
+
+    Deliberately strict: a mirror, alternate index, git/url source, or an
+    unrecognized source shape is NOT trusted, so it is blocked and a human
+    looks at it. That is the point of the check on a release — an unexpected
+    source is the supply-chain signal, and a block just parks it for a
+    maintainer (cheap and rare on a release PR).
+    """
     if not isinstance(source, dict):
         return False
-    if "registry" in source:
-        return "pypi.org" in str(source["registry"])
     # Workspace members / virtual roots are the SDK's own packages.
-    return "virtual" in source or "editable" in source
+    if "virtual" in source or "editable" in source:
+        return True
+    if "registry" in source:
+        return _registry_host(source) in _TRUSTED_REGISTRY_HOSTS
+    return False
 
 
 def main() -> int:
@@ -141,10 +167,12 @@ def main() -> int:
         ]
         results = osv_query_batch(queries)
         if results is None:
-            report.warn("OSV lookup failed")
+            report.block("OSV lookup failed")
             report.add(
-                "> OSV lookup failed (network); reported as a warning, not a "
-                "blocker. Re-run to retry."
+                "> OSV lookup failed (network): could not verify new/bumped "
+                "deps against known vulnerabilities. Blocking on purpose — a "
+                "release that can't be checked shouldn't ship. Often transient; "
+                "re-run to retry, or a maintainer can clear it on the fly."
             )
         else:
             vuln_hits = []

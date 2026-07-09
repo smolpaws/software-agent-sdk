@@ -65,9 +65,11 @@ def osv_query_batch(
 ) -> list[dict[str, object]] | None:
     """Query the OSV batched vulnerability API. Returns None on network failure.
 
-    OSV is public and needs no auth. Network failure is treated as a warning by
-    callers (do not block a release on a flaky lookup), while an actual
-    known-vulnerable hit is a hard finding.
+    OSV is public and needs no auth. A None return means the release diff could
+    not be verified against known vulnerabilities; the dependency-diff caller
+    treats that as blocking (fail-closed — a release that can't be checked
+    shouldn't ship), and an actual known-vulnerable hit is likewise a hard
+    finding.
     """
     payload = json.dumps({"queries": queries}).encode("utf-8")
     req = urllib.request.Request(

@@ -11,15 +11,26 @@ run-name: >-
 #   2. dependency risk: new/bumped deps with known OSV vulns or non-PyPI
 #      sources.
 #
+# Two behaviors, one job:
+#   A. Always-on for `release/**` PRs — these are internal repo branches (never
+#      forks), so this is the guaranteed gate on the thing that actually ships,
+#      and it cannot be skipped (no label required).
+#   B. Best-effort for any other branch via the `security-scan` label or manual
+#      dispatch — a human opts a feature/fork PR in.
+#
 # Deterministic by design: the scanners only read git history and query
 # read-only APIs (GitHub REST, OSV). They never install or execute the code
 # under review — a security gate that runs untrusted content is itself an
 # injection target. We therefore use plain `pull_request` (not
-# pull_request_target) and need no secrets beyond the default GITHUB_TOKEN.
+# pull_request_target) and need no secrets beyond the default GITHUB_TOKEN. On
+# fork PRs that token is read-only, so results always go to the job summary and
+# the PR comment is posted only when the token can write (non-fork).
 
 on:
     pull_request:
-        types: [labeled]
+        # `opened/synchronize/reopened` drive behavior A on release/** PRs;
+        # `labeled` drives behavior B anywhere.
+        types: [opened, synchronize, reopened, labeled]
     workflow_dispatch:
         inputs:
             reason:
@@ -40,10 +51,13 @@ permissions:
 
 jobs:
     security-scan:
-        # Only run on the release label, or manual dispatch.
+        # Behavior A: always on release/** PRs. Behavior B: the label, or manual
+        # dispatch. Non-release PRs without the label are skipped so this does
+        # not run on every open PR.
         if: >-
+            github.event_name == 'workflow_dispatch' ||
             github.event.label.name == 'security-scan' ||
-            github.event_name == 'workflow_dispatch'
+            startsWith(github.event.pull_request.head.ref, 'release/')
         runs-on: ubuntu-24.04
         timeout-minutes: 15
         steps:
@@ -79,12 +93,8 @@ jobs:
                   SECURITY_SCAN_OUTPUT: ${{ github.workspace }}/security-report.md
               run: python .github/scripts/check_dependency_diff.py
 
-            - name: Post results to the PR
-              if: github.event_name == 'pull_request'
-              env:
-                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-                  PR_NUMBER: ${{ github.event.pull_request.number }}
-                  REPO: ${{ github.repository }}
+            - name: Assemble report
+              if: always()
               run: |
                   set -euo pipefail
                   BODY_FILE="security-report.md"
@@ -99,13 +109,51 @@ jobs:
                       echo
                       echo "<sub>Deterministic scanners: approval-drift + supply-chain dependency diff. Read-only; no PR code executed.</sub>"
                   } > comment.md
+                  # Always surface the full report in the Actions run summary —
+                  # this is the one place that works even on fork PRs where the
+                  # token cannot comment.
+                  cat comment.md >> "$GITHUB_STEP_SUMMARY"
+
+            - name: Post results comment (non-fork PRs only)
+              # On a fork PR the default token is read-only regardless of the
+              # permissions block, so the POST would 403. Guard on same-repo so
+              # a stray label on a fork PR doesn't produce a confusing red X —
+              # the run summary above still has the full results either way.
+              if: >-
+                  github.event_name == 'pull_request' &&
+                  github.event.pull_request.head.repo.full_name == github.repository
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+                  PR_NUMBER: ${{ github.event.pull_request.number }}
+                  REPO: ${{ github.repository }}
+              run: |
+                  set -euo pipefail
+                  # Upsert: reuse our own marker comment instead of spamming a
+                  # fresh one on every labeled/synchronize event.
+                  MARKER="<!-- release-security-scan -->"
+                  printf '%s\n' "$MARKER" >> comment.md
                   jq -Rs '{body: .}' comment.md > payload.json
-                  curl -sSf -X POST \
+                  EXISTING=$(curl -sSf \
                       -H "Authorization: token ${GITHUB_TOKEN}" \
                       -H "Accept: application/vnd.github+json" \
-                      "https://api.github.com/repos/${REPO}/issues/${PR_NUMBER}/comments" \
-                      -d @payload.json > /dev/null
-                  echo "Posted security-scan comment to PR #${PR_NUMBER}."
+                      "https://api.github.com/repos/${REPO}/issues/${PR_NUMBER}/comments?per_page=100" \
+                      | jq -r --arg m "$MARKER" \
+                          'map(select(.body | contains($m))) | .[0].id // empty')
+                  if [ -n "$EXISTING" ]; then
+                      curl -sSf -X PATCH \
+                          -H "Authorization: token ${GITHUB_TOKEN}" \
+                          -H "Accept: application/vnd.github+json" \
+                          "https://api.github.com/repos/${REPO}/issues/comments/${EXISTING}" \
+                          -d @payload.json > /dev/null
+                      echo "Updated existing security-scan comment (${EXISTING})."
+                  else
+                      curl -sSf -X POST \
+                          -H "Authorization: token ${GITHUB_TOKEN}" \
+                          -H "Accept: application/vnd.github+json" \
+                          "https://api.github.com/repos/${REPO}/issues/${PR_NUMBER}/comments" \
+                          -d @payload.json > /dev/null
+                      echo "Posted security-scan comment to PR #${PR_NUMBER}."
+                  fi
 
             - name: Fail if any check found blocking issues
               run: |
