@@ -222,6 +222,34 @@ class EventLog(EventsListBase):
             )
             raise
 
+    def rewrite_event(self, idx: int, event: Event) -> None:
+        """Overwrite the already-persisted event at ``idx`` in place.
+
+        The event keeps its index and id (the filename is unchanged); only its
+        stored payload is replaced. Used by one-time on-disk migrations that
+        repair a single event's fields (e.g. re-linking a wrongly-rooted
+        ``parent_id``) without appending or reordering the log.
+
+        Raises:
+            IndexError: If ``idx`` is out of range.
+            ValueError: If ``event.id`` does not match the event stored at ``idx``.
+        """
+        if idx < 0 or idx >= self._length:
+            raise IndexError(f"Event index out of range: {idx}")
+        existing_id = self._idx_to_id[idx]
+        if event.id != existing_id:
+            raise ValueError(
+                f"rewrite_event id mismatch at idx {idx}: stored '{existing_id}', "
+                f"got '{event.id}'"
+            )
+        payload = event.model_dump_json(exclude_none=True)
+        write_guard = (
+            nullcontext() if self._write_guard is None else self._write_guard()
+        )
+        with write_guard:
+            self._fs.write(self._path(idx, event_id=existing_id), payload)
+        self._event_cache[idx] = event
+
     def _count_events_on_disk(self) -> int:
         """Count event files on disk."""
         try:

@@ -33,11 +33,13 @@ from openhands.sdk.context import AgentContext, KeywordTrigger, Skill
 from openhands.sdk.context.condenser.llm_summarizing_condenser import (
     LLMSummarizingCondenser,
 )
+from openhands.sdk.conversation.event_store import EventLog
 from openhands.sdk.conversation.impl.local_conversation import LocalConversation
 from openhands.sdk.event import ActionEvent, MessageEvent
 from openhands.sdk.event.conversation_state import ConversationStateUpdateEvent
 from openhands.sdk.event.types import ROOT_PARENT_ID
-from openhands.sdk.llm import LLM
+from openhands.sdk.io import LocalFileStore
+from openhands.sdk.llm import LLM, Message, TextContent
 from openhands.sdk.llm.utils.openhands_provider import (
     LITELLM_PROXY_PREFIX,
     OPENHANDS_LLM_PROXY_BASE_URL,
@@ -992,3 +994,113 @@ def test_restore_event_tree_conversation_keeps_history(mock_completion):
             assert set(original_ids).issubset(reachable)
         finally:
             restored.close()
+
+
+@patch("openhands.sdk.llm.llm.litellm_completion")
+def test_restore_migrates_orphaned_root_and_restores_history(mock_completion):
+    """A conversation damaged by the pre-#4068 bug is healed on the next resume.
+
+    #4068 stops *new* legacy resumes from stamping a false ``__root__``, but
+    conversations already written that way stay broken until repaired. Here we
+    reproduce the exact on-disk damage from a *real* session, then assert that
+    resuming under the current code re-links the orphaned event to the legacy tail
+    (the one-time migration), so the full history is reachable again and the fix
+    persists to disk.
+    """
+    mock_completion.return_value = create_mock_litellm_response(
+        content="Acknowledged.", finish_reason="stop"
+    )
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        base = Path(temp_dir)
+        lifecycle = RestoreLifecycle(
+            workspace_dir=base / "workspace",
+            persistence_base_dir=base / "persist",
+        )
+        lifecycle.workspace_dir.mkdir(parents=True, exist_ok=True)
+        lifecycle.persistence_base_dir.mkdir(parents=True, exist_ok=True)
+
+        tools = [Tool(name="TerminalTool"), Tool(name="FileEditorTool")]
+        agent = _agent(
+            llm_model="gpt-4o-mini",
+            tools=tools,
+            condenser_max_size=80,
+            skill_name="skill-v1",
+            skill_keyword="alpha",
+        )
+
+        # 1) Real session to get a realistic event log.
+        lifecycle.run_initial_session(agent)
+        assert lifecycle.conversation_id is not None
+        events_dir = (
+            lifecycle.persistence_base_dir / lifecycle.conversation_id.hex / "events"
+        )
+        event_files = sorted(
+            events_dir.glob("event-*.json"),
+            key=lambda p: int(p.name.split("-")[1]),
+        )
+        assert len(event_files) >= 3
+        legacy_ids = [json.loads(p.read_text())["id"] for p in event_files]
+
+        # 2) Downgrade to the pre-event-tree shape (strip parent_id, drop HEAD).
+        for p in event_files:
+            data = json.loads(p.read_text())
+            data.pop("parent_id", None)
+            p.write_text(json.dumps(data))
+        base_state = lifecycle.read_base_state()
+        base_state.pop("leaf_event_id", None)
+        base_state.pop("head_is_empty", None)
+        lifecycle.write_base_state(base_state)
+
+        # 3) Append the interrupted-startup artifact (non-tree, carries parent_id)
+        #    that a newer server chained onto the legacy tail...
+        artifact = ConversationStateUpdateEvent(
+            parent_id=legacy_ids[-1], key="execution_status", value="idle"
+        )
+        artifact_idx = len(event_files)
+        (events_dir / f"event-{artifact_idx:05d}-{artifact.id}.json").write_text(
+            artifact.model_dump_json(exclude_none=True)
+        )
+
+        # 4) ...then the post-resume user event WRONGLY stamped __root__ (the bug).
+        orphan = MessageEvent(
+            source="user",
+            llm_message=Message(role="user", content=[TextContent(text="after")]),
+            parent_id=ROOT_PARENT_ID,
+        )
+        orphan_idx = artifact_idx + 1
+        (events_dir / f"event-{orphan_idx:05d}-{orphan.id}.json").write_text(
+            orphan.model_dump_json(exclude_none=True)
+        )
+
+        # Sanity: the damage really orphans history before the migration runs.
+        conversation_dir = (
+            lifecycle.persistence_base_dir / lifecycle.conversation_id.hex
+        )
+        pre = EventLog(LocalFileStore(str(conversation_dir)))
+        assert [e.id for e in pre.path_to_root(orphan.id)] == [orphan.id]
+
+        # 5) Resume under current code → migration runs.
+        restored = lifecycle.restore(agent)
+        try:
+            healed = next(e for e in restored.state.events if e.id == orphan.id)
+            assert healed.parent_id == legacy_ids[-1]
+            assert healed.parent_id != ROOT_PARENT_ID
+
+            reachable = [e.id for e in restored.state.events.path_to_root(orphan.id)]
+            # Every legacy event is reachable again, in order.
+            assert [i for i in reachable if i in set(legacy_ids)] == legacy_ids
+            assert reachable[-1] == orphan.id
+
+            # Continuing chains onto the healed tail, not a false root.
+            restored.send_message("Third message")
+            new_event = restored.state.events[-1]
+            assert new_event.parent_id != ROOT_PARENT_ID
+            after = {e.id for e in restored.state.events.path_to_root(new_event.id)}
+            assert set(legacy_ids).issubset(after)
+        finally:
+            restored.close()
+
+        # 6) The repair is durable on disk.
+        reopened = EventLog(LocalFileStore(str(conversation_dir)))
+        assert reopened[reopened.get_index(orphan.id)].parent_id == legacy_ids[-1]

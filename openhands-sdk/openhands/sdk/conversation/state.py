@@ -260,6 +260,80 @@ class ConversationState(OpenHandsModel):
     def events(self) -> EventLog:
         return self._events
 
+    def _migrate_orphaned_root_tail(self) -> None:
+        """One-time on-disk repair for history orphaned by the pre-#4068 bug.
+
+        Before #4068, resuming a pre-event-tree conversation whose stored tail was
+        a non-tree artifact (a ``ConversationStateUpdateEvent`` / ``Conversation
+        ErrorEvent`` written during an interrupted startup) could stamp the first
+        post-resume event with ``parent_id == "__root__"``. ``_effective_parent_id``
+        treats that as a hard root, so ``path_to_root`` stops there and every older
+        event is orphaned from the LLM's view — even though all event files are
+        intact on disk. #4068 stops *new* resumes from doing this, but conversations
+        already written with the bad ``__root__`` stay broken until repaired.
+
+        This heals exactly the bug's on-disk fingerprint and nothing else. To be
+        repaired, an event at ``idx > 0`` with ``parent_id == "__root__"`` must:
+
+        1. sit immediately after a **non-tree artifact** (a
+           ``ConversationStateUpdateEvent`` / ``ConversationErrorEvent``) — the
+           stale tail that tricked ``_resolve_active_leaf`` into returning ``None``.
+           The bug cannot occur without such a tail, and a deliberate feature root
+           (``navigate_to(None)`` then emit) sits after a *real* event, so this
+           condition alone excludes it; and
+        2. sit on top of an otherwise-legacy log: every real (non-artifact) event
+           before it carries no ``parent_id``.
+
+        When both hold, the event is re-linked to the nearest preceding real event
+        (the legacy tail), reconnecting the history. Anything else — genuine tree
+        roots, deliberate ``navigate_to(None)`` roots, real branch points — is left
+        untouched.
+        """
+        from openhands.sdk.event.conversation_error import ConversationErrorEvent
+        from openhands.sdk.event.conversation_state import (
+            ConversationStateUpdateEvent,
+        )
+
+        events = self._events
+        n = len(events)
+        if n < 2:
+            return
+
+        artifacts = (ConversationStateUpdateEvent, ConversationErrorEvent)
+        repaired = 0
+        for idx in range(1, n):
+            event = events[idx]
+            if event.parent_id != ROOT_PARENT_ID:
+                continue
+            # (1) The bug's fingerprint: the wrongly-rooted event sits directly on
+            # a non-tree artifact tail. A deliberate navigate_to(None) root follows
+            # a real event, so it fails this and is left alone.
+            if not isinstance(events[idx - 1], artifacts):
+                continue
+            # (2) Everything real below must be pre-tree (no parent_id), i.e. a
+            # genuine legacy log rather than a real tree with branches.
+            preceding_real = [
+                events[j] for j in range(idx) if not isinstance(events[j], artifacts)
+            ]
+            if not preceding_real:
+                continue
+            if any(e.parent_id is not None for e in preceding_real):
+                continue
+            new_parent = preceding_real[-1].id
+            self._events.rewrite_event(
+                idx, event.model_copy(update={"parent_id": new_parent})
+            )
+            repaired += 1
+
+        if repaired:
+            logger.info(
+                "Migrated %d orphaned-root event(s) in conversation %s: re-linked "
+                "post-resume event(s) that were wrongly stamped '__root__' to the "
+                "legacy tail, restoring prior history.",
+                repaired,
+                self.id,
+            )
+
     def _resolve_active_leaf(self) -> EventID | None:
         """The effective HEAD, resolving a ``None`` ``leaf_event_id`` by lineage.
 
@@ -531,6 +605,10 @@ class ConversationState(OpenHandsModel):
             state._fs = file_store
             state._events = EventLog(file_store, dir_path=EVENTS_DIR)
             state._cipher = cipher
+
+            # One-time repair for conversations orphaned by the pre-#4068
+            # legacy-resume bug (see _migrate_orphaned_root_tail).
+            state._migrate_orphaned_root_tail()
 
             # Cold-load: rebuild the cached view with full property
             # enforcement — persisted events may come from an older code

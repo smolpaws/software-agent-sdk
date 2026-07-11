@@ -14,6 +14,7 @@ from pydantic import SecretStr
 from openhands.sdk.agent import Agent
 from openhands.sdk.context.view import View
 from openhands.sdk.conversation import Conversation, LocalConversation
+from openhands.sdk.conversation.event_store import EventLog
 from openhands.sdk.conversation.state import ConversationState
 from openhands.sdk.event import ActionEvent
 from openhands.sdk.event.base import Event
@@ -23,6 +24,7 @@ from openhands.sdk.event.conversation_state import ConversationStateUpdateEvent
 from openhands.sdk.event.llm_convertible import MessageEvent
 from openhands.sdk.event.types import ROOT_PARENT_ID, SourceType
 from openhands.sdk.event.user_action import PauseEvent
+from openhands.sdk.io import LocalFileStore
 from openhands.sdk.llm import LLM, Message, MessageToolCall, TextContent
 from openhands.sdk.tool.schema import Action
 
@@ -634,3 +636,89 @@ def test_fork_preserves_empty_head():
         fork = conv.fork()
         assert fork.state.head_is_empty is True
         assert _view_ids(fork) == []
+
+
+def _build_orphaned_legacy_log(events, n_legacy: int = 3):
+    """Reproduce the exact pre-#4068 on-disk damage in ``events``.
+
+    Shape written to disk: ``n_legacy`` legacy events (no ``parent_id``), then a
+    non-tree artifact (``ConversationStateUpdateEvent`` — the interrupted-startup
+    tail), then the post-resume event wrongly stamped ``parent_id == "__root__"``
+    (which orphaned everything below it). Returns ``(legacy_events, orphan_event)``.
+    """
+    legacy = [_msg(f"legacy-{i}") for i in range(n_legacy)]
+    for ev in legacy:
+        # Legacy events carry no parent_id: write pre-tree shape directly.
+        events.append(ev.model_copy(update={"parent_id": None}))
+    artifact = ConversationStateUpdateEvent(
+        parent_id=legacy[-1].id, key="execution_status", value="idle"
+    )
+    events.append(artifact)
+    orphan = _msg("post-resume")
+    events.append(orphan)
+    # Stamp the orphaning root exactly as the buggy code left it on disk.
+    events.rewrite_event(
+        len(events) - 1, orphan.model_copy(update={"parent_id": ROOT_PARENT_ID})
+    )
+    return legacy, orphan
+
+
+def test_migration_heals_orphaned_root_over_legacy_tail():
+    """Resuming a conversation damaged by the pre-#4068 bug restores history.
+
+    Reproduce the exact broken shape (legacy log + artifact tail + a post-resume
+    event wrongly stamped ``__root__``, persisted that way, orphaning all prior
+    events). On the next resume the one-time migration must re-link that event to
+    the legacy tail so the full history is reachable again — durably on disk.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        conv = _conversation(tmp, delete_on_close=False)
+        legacy, orphan = _build_orphaned_legacy_log(conv.state.events)
+        conv_id = conv.id
+        conv.close()
+
+        # Confirm the damage is real before the migration runs.
+        broken = EventLog(LocalFileStore(str(Path(tmp) / conv_id.hex)))
+        assert broken[len(broken) - 1].parent_id == ROOT_PARENT_ID
+        assert [e.id for e in broken.path_to_root(orphan.id)] == [orphan.id]
+
+        # Resume: the migration runs inside ConversationState.create.
+        resumed = _conversation(tmp, conversation_id=conv_id, delete_on_close=False)
+        legacy_ids = [e.id for e in legacy]
+
+        # The orphaned event is re-linked to the legacy tail (not __root__).
+        healed = _by_id(resumed.state.events, orphan.id)
+        assert healed.parent_id == legacy_ids[-1]
+        assert healed.parent_id != ROOT_PARENT_ID
+        # Full legacy history is reachable again, in order (artifact not on branch).
+        reachable = [e.id for e in resumed.state.events.path_to_root(orphan.id)]
+        assert [i for i in reachable if i in set(legacy_ids)] == legacy_ids
+        assert reachable[-1] == orphan.id
+        resumed.close()
+
+        # The repair is durable: a fresh cold read sees the re-link, not __root__.
+        reopened = EventLog(LocalFileStore(str(Path(tmp) / conv_id.hex)))
+        orphan_idx = reopened.get_index(orphan.id)
+        assert reopened[orphan_idx].parent_id == legacy_ids[-1]
+
+
+def test_migration_leaves_deliberate_feature_root_untouched():
+    """The migration must not rewrite a legitimate feature-created root.
+
+    ``navigate_to(None)`` then emitting starts a real new root (``__root__``) in a
+    genuine tree log — events before it carry ``parent_id`` values. That is not the
+    legacy-orphan shape, so the migration must leave it alone on resume.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        conv = _conversation(tmp, delete_on_close=False)
+        _emit(conv, _msg("first"))  # real tree event (gets a parent_id)
+        conv.navigate_to(None)
+        fresh_root = _emit(conv, _msg("fresh root"))  # legitimate __root__
+        assert _by_id(conv.state.events, fresh_root.id).parent_id == ROOT_PARENT_ID
+        conv_id = conv.id
+        conv.close()
+
+        resumed = _conversation(tmp, conversation_id=conv_id, delete_on_close=False)
+        # Untouched: it is still a deliberate root.
+        assert _by_id(resumed.state.events, fresh_root.id).parent_id == ROOT_PARENT_ID
+        resumed.close()
