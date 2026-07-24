@@ -294,6 +294,7 @@ def test_download_trajectory_redacts_llm_and_condenser_secrets(
     plaintext_key = "sk-plaintext-main-0123456789"
     condenser_key = "sk-plaintext-condenser-987654321"
     encrypted_blob = "gAAAAABencrypted_condenser_blob_value"
+    encrypted_custom_secret = "gAAAAABencrypted_custom_registry_secret"
 
     # meta.json: plaintext main key + encrypted condenser key
     meta = {
@@ -305,12 +306,19 @@ def test_download_trajectory_redacts_llm_and_condenser_secrets(
     }
     (conversation_dir / "meta.json").write_text(json.dumps(meta))
 
-    # base_state.json mirrors the agent config with a plaintext condenser key
+    # base_state.json mirrors the agent config with a plaintext condenser key,
+    # plus a cipher-encrypted custom secret whose field name ("value") is not
+    # in the LLM secret-field list.
     base_state = {
         "agent": {
             "llm": {"model": "gpt-4o", "api_key": plaintext_key},
             "condenser": {"llm": {"model": "gpt-4o-mini", "api_key": condenser_key}},
-        }
+        },
+        "secret_registry": {
+            "secret_sources": {
+                "MY_TOKEN": {"kind": "StaticSecret", "value": encrypted_custom_secret}
+            }
+        },
     }
     (conversation_dir / "base_state.json").write_text(json.dumps(base_state))
 
@@ -341,7 +349,12 @@ def test_download_trajectory_redacts_llm_and_condenser_secrets(
         blob = b"\n".join(archive.read(name) for name in archive.namelist())
 
     # No secret material of any kind survives into the archive.
-    for secret in (plaintext_key, condenser_key, encrypted_blob):
+    for secret in (
+        plaintext_key,
+        condenser_key,
+        encrypted_blob,
+        encrypted_custom_secret,
+    ):
         assert secret.encode() not in blob
 
     # The redaction marker is present where keys used to be, and non-secret

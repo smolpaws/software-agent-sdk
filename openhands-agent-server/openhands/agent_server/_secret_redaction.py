@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 
 from openhands.sdk.llm.llm import LLM_SECRET_FIELDS
+from openhands.sdk.utils.cipher import FERNET_TOKEN_PREFIX
 from openhands.sdk.utils.pydantic_secrets import REDACTED_SECRET_VALUE
 
 
@@ -19,6 +20,18 @@ from openhands.sdk.utils.pydantic_secrets import REDACTED_SECRET_VALUE
 TRAJECTORY_SECRET_FIELDS: frozenset[str] = frozenset(
     (*LLM_SECRET_FIELDS, "llm_api_key")
 )
+
+
+def _is_secret_value(key: object, value: object) -> bool:
+    if not isinstance(value, str) or value in ("", REDACTED_SECRET_VALUE):
+        return False
+    # Any Fernet token in a persisted conversation is ciphertext produced with
+    # the server's OH_SECRET_KEY (e.g. custom secrets in
+    # ``secret_registry.secret_sources``) and therefore recoverable secret
+    # material, regardless of which field carries it.
+    if value.startswith(FERNET_TOKEN_PREFIX):
+        return True
+    return key in TRAJECTORY_SECRET_FIELDS
 
 
 def redact_secrets_in_obj(obj: object) -> bool:
@@ -32,19 +45,17 @@ def redact_secrets_in_obj(obj: object) -> bool:
     changed = False
     if isinstance(obj, dict):
         for key, value in obj.items():
-            if (
-                key in TRAJECTORY_SECRET_FIELDS
-                and isinstance(value, str)
-                and value != ""
-                and value != REDACTED_SECRET_VALUE
-            ):
+            if _is_secret_value(key, value):
                 obj[key] = REDACTED_SECRET_VALUE
                 changed = True
             elif redact_secrets_in_obj(value):
                 changed = True
     elif isinstance(obj, list):
-        for item in obj:
-            if redact_secrets_in_obj(item):
+        for index, item in enumerate(obj):
+            if _is_secret_value(None, item):
+                obj[index] = REDACTED_SECRET_VALUE
+                changed = True
+            elif redact_secrets_in_obj(item):
                 changed = True
     return changed
 
